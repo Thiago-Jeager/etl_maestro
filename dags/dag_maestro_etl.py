@@ -618,9 +618,10 @@ def taller_etl_unl_wap():
         logger.info("🔄 Iniciando fase DBT: Materialización de modelos")
 
         dbt_dir = "/opt/airflow/dbt/proyecto_unl"
+        dbt_profiles_dir = "/opt/airflow/dbt"
 
         # Comando dbt seguro (sin shell=True)
-        cmd = ["dbt", "run", "--profiles-dir", ".", "--target", "prod"]
+        cmd = ["dbt", "run", "--profiles-dir", dbt_profiles_dir, "--target", "prod"]
 
         try:
             result = subprocess.run(

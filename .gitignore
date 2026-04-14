@@ -5,3 +5,8 @@ plugins/
 __pycache__/
 *.pyc
 postgres_data/
+
+# dbt artifacts and dependencies
+/dbt/proyecto_unl/dbt_packages/
+/dbt/proyecto_unl/target/
+/dbt/.user.yml
