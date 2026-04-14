@@ -1,7 +1,7 @@
 version: 1
 sources:
-  - name: raw_data
-    schema: public
+  - name: prod_source
+    schema: prod
     tables:
-      - name: raw_clima_nacional
+      - name: raw_transactions
     

@@ -1,48 +1,111 @@
-version: '3.8'
-x-airflow-common:
-  &airflow-common
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-taller_etl_master-airflow:latest}
   build: .
-  environment:
+  # Cargar variables de entorno desde un archivo .env
+  env_file: .env
+  environment: &airflow-common-env
+    # Variables de entorno comunes para todos los servicios de Airflow
+
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    DBT_PROFILES_DIR: /opt/airflow/dbt/proyecto_unl
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'  # Desactiva los ejemplos para un entorno limpio
+    AIRFLOW__API__AUTH_BACKEND: 'airflow.api.auth.backend.basic_auth'
+    # Inyectar las variables para que python pueda acceder a ellas a través de os.getenv()
+    API_KEY: ${API_KEY}
+    API_BASE_URL: ${API_BASE_URL}
+    DB_USER: ${DB_USER}
+    DB_PASS: ${DB_PASS}
+    DB_HOST: ${DB_HOST}
+    DB_NAME: ${DB_NAME}
+    DB_PORT: ${DB_PORT}
+
+    # Definir la conexión a la base de datos warehouse
+    AIRFLOW_CONN_POSTGRES_WAREHOUSE_CONN: postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+
+    # Configurar Great Expectations (GX)
+    GX_NO_USAGE_STATS: 'true' # Desactiva la recopilación de estadísticas para evitar problemas de rendimiento
+
+
+    
+    # Definimos la ruta de perfiles para dbt
+    DBT_PROFILES_DIR: /opt/airflow/dbt
   volumes:
     - ./dags:/opt/airflow/dags
-    - ./data_lake:/opt/airflow/data_lake
-    - ./dbt:/opt/airflow/dbt
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./dbt:/opt/airflow/dbt  # AGREGAR ESTE VOLUMEN para persistencia
+    - ./gx:/opt/airflow/gx  # Volumen para Great Expectations
+    - ./data_lake:/opt/airflow/data_lake  # Volumen para datos de entrada/salida
+    - ./init_db:/docker-entrypoint-initdb.d # Volumen para scripts de inicialización de la base de datos
+
   user: "${AIRFLOW_UID:-50000}:0"
 
 services:
-  postgres:
+  postgres: # Base de Datos Relacional que almacena los metadatos de airflow (DAGs, Conexiones, variables)
     image: postgres:13
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
-    ports:
-      - "5432:5432"
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
 
-  postgres_warehouse:
-    image: postgres:13
-    environment:
-      POSTGRES_USER: user_dbt
-      POSTGRES_PASSWORD: password_dbt
-      POSTGRES_DB: db_warehouse
-    ports:
-      - "5433:5432"
-
-  airflow-webserver:
+  airflow-webserver: # Interfaz Web de Airflow
     <<: *airflow-common
     command: webserver
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
 
-  airflow-scheduler:
+  airflow-scheduler: # Programa y ejecuta las tareas definidas en los DAGs
     <<: *airflow-common
     command: scheduler
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
 
+  airflow-init: # Servicio de inicialización que prepara la base de datos y crea el usuario administrador por defecto.
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+  
+  # Agregamos la base de datos de negocio /DBT   -------------------------> CAMBIO 1
+  postgres_warehouse:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5433:5432" # Mapeamos a un puerto diferente (5433) para evitar conflicto con la de metadatos
+    volumes:
+      - warehouse-db-volume:/var/lib/postgresql/data
+      - ./init_db:/docker-entrypoint-initdb.d # Volumen para scripts de inicialización de la base de datos de negocio
+
+            
+
+volumes:
+  postgres-db-volume:
+  warehouse-db-volume: # Nuevo volumen para persistencia de datos

@@ -10,3 +10,12 @@ proyecto_unl:
       dbname: db_warehouse
       schema: public
       threads: 4
+    prod:
+      type: postgres
+      host: postgres_warehouse
+      port: 5432
+      user: user_dbt
+      password: password_dbt
+      dbname: db_warehouse
+      schema: public
+      threads: 4

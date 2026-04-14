@@ -1,0 +1,67 @@
+{
+  "data_asset_type": "table",
+  "expectation_suite_name": "transactions_critical_suite",
+  "expectations": [
+    {
+      "expectation_type": "expect_table_row_count_to_be_between",
+      "meta": {"description": "Verificar que haya al menos 1 registro", "severity": "CRITICAL"},
+      "kwargs": {"min_value": 1, "strict_max": false}
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "meta": {"description": "user_id no debe ser nulo (Clave foránea)", "severity": "CRITICAL"},
+      "kwargs": {"column": "user_id"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "meta": {"description": "transaction_id es clave primaria", "severity": "CRITICAL"},
+      "kwargs": {"column": "transaction_id"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_unique",
+      "meta": {"description": "Cada transaction_id debe ser único", "severity": "CRITICAL"},
+      "kwargs": {"column": "transaction_id"}
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "meta": {"description": "amount debe ser positivo y razonable", "severity": "CRITICAL"},
+      "kwargs": {
+        "column": "amount",
+        "min_value": 0.01,
+        "max_value": 100000,
+        "mostly": 0.99
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_in_set",
+      "meta": {"description": "currency debe ser moneda válida", "severity": "CRITICAL"},
+      "kwargs": {
+        "column": "currency",
+        "value_set": ["USD", "EUR", "GBP"],
+        "mostly": 1.0
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_in_set",
+      "meta": {"description": "status debe tener valores válidos", "severity": "CRITICAL"},
+      "kwargs": {
+        "column": "status",
+        "value_set": ["COMPLETED", "PENDING", "FAILED"]
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_match_regex",
+      "meta": {"description": "transaction_id debe ser UUID válido", "severity": "CRITICAL"},
+      "kwargs": {
+        "column": "transaction_id",
+        "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      }
+    }
+  ],
+  "meta": {
+    "great_expectations_version": "0.18.15",
+    "created_at": "2026-01-01T00:00:00Z",
+    "description": "Suite de calidad para transacciones financieras - Proyecto UNL"
+  }
+}
+

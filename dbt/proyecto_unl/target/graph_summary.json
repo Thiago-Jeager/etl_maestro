@@ -1,0 +1,1 @@
+{"_invocation_id": "844265ed-639a-4335-8048-f9b1c99d0768", "linked": {"0": {"name": "source.proyecto_unl.raw_data.raw_clima_nacional", "type": "source", "succ": [1]}, "1": {"name": "model.proyecto_unl.stg_clima", "type": "model"}}}

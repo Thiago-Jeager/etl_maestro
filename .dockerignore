@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+logs
+data_lake
+init_db
+init_dbe
+dbt/proyecto_unl/target
+gx/uncommitted
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.swp

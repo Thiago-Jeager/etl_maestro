@@ -1,0 +1,36 @@
+{
+  "data_asset_type": "table",
+  "expectation_suite_name": "transactions_warnings_suite",
+  "expectations": [
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "meta": {
+        "description": "Amount debe ser positivo y razonable",
+        "severity": "WARNING"
+      },
+      "kwargs": {
+        "column": "amount",
+        "min_value": 0.01,
+        "max_value": 100000,
+        "mostly": 0.99
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_match_regex",
+      "meta": {
+        "description": "transaction_id debe ser UUID válido",
+        "severity": "WARNING"
+      },
+      "kwargs": {
+        "column": "transaction_id",
+        "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      }
+    }
+  ],
+  "meta": {
+    "great_expectations_version": "0.18.15",
+    "description": "Validaciones de CALIDAD que alertan sobre posibles problemas pero no bloquean la ejecución",
+    "created_at": "2024-06-01T12:00:00.000Z",
+    "blocking": false
+  }
+}
