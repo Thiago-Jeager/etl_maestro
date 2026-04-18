@@ -420,7 +420,7 @@ def taller_etl_unl_wap():
                         "total_records": total_expectations,
                         "failed_records": total_failed,
                         "success_rate": overall_success_rate,
-                        "critical_failures": json.dumps(overall_results['critical']['details'])
+                        "critical_failures": [json.dumps(item) for item in overall_results['critical']['details']]
                     })
             except Exception as db_err:
                 logger.warning(f"⚠️ No se pudo registrar en gx_validation_logs: {str(db_err)[:100]}")
