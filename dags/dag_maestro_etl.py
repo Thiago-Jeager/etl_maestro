@@ -19,6 +19,7 @@ from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.exceptions import AirflowFailException
+from scripts.masking_transform import load_masking_rules, apply_masking
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -205,41 +206,16 @@ def taller_etl_unl_wap():
     # FASE 2: AUDIT - Validación de calidad con Great Expectations
     # -------------------------------------------------------------------------
     @task(task_id='audit_with_gx')
-    def audit_with_gx(extract_metrics: Dict[str, int]) -> bool:
+    def audit_with_gx(extract_metrics: Dict[str, int]) -> Dict[str, Any]:
         """
-        Ejecuta validaciones de calidad usando Great Expectations.
-        Carga dos suites: CRITICAL (obligatorias) y WARNINGS (alertas).
-        Registra anomalías pero permite continuar el pipeline (patrón WAP tolerante).
-
-        Args:
-            extract_metrics: Métricas de la fase de extracción
-
-        Returns:
-            True si puede continuar el pipeline
+        Ejecuta validaciones en DOS fases:
+        1. Suite CRITICO: Si falla -> BLOQUEA (AirflowFailException)
+        2. Suite ADVERTENCIA: Si falla -> Registra y continua
         """
-        logger.info("🔍 Iniciando fase AUDIT: Validación con Great Expectations")
-
-        # Conexión a la base de datos
+        logger.info("Iniciando fase AUDIT: Validacion GX")
         engine = create_engine(DB_URI)
 
-        # -------------------------------------------------------------------------
-        # VALIDACIÓN 1: Chequeo rápido con SQL para fallos obvios
-        # -------------------------------------------------------------------------
-        logger.info("📋 Ejecutando validaciones SQL preliminares...")
-
-        # Detectar montos negativos (la API inyecta 4% intencionalmente)
-        # En patrón WAP: detectar pero NO bloquear - dejar que PUBLISH filtre
-        with engine.connect() as conn:
-            result = conn.execute(text(
-                "SELECT COUNT(*) FROM audit.raw_transactions WHERE amount < 0"
-            ))
-            negative_count = result.scalar()
-
-        if negative_count > 0:
-            logger.warning(f"⚠️ ADVERTENCIA: {negative_count} registros con montos negativos detectados")
-            logger.warning(f"  Estos serán filtrados en la fase PUBLISH. La validación continúa...")
-
-        # Detectar valores nulos en campos obligatorios
+        # Chequeos SQL rapidos
         with engine.connect() as conn:
             result = conn.execute(text("""
                 SELECT
@@ -248,253 +224,159 @@ def taller_etl_unl_wap():
                 FROM audit.raw_transactions
             """))
             null_stats = result.fetchone()
+            if null_stats.null_users > 0:
+                raise AirflowFailException(f"{null_stats.null_users} registros sin user_id")
+            if null_stats.null_ids > 0:
+                raise AirflowFailException(f"{null_stats.null_ids} registros sin transaction_id")
 
-        if null_stats.null_users > 0 or null_stats.null_ids > 0:
-            logger.warning(f"⚠️ Advertencia: {null_stats.null_users} user_ids nulos, "
-                           f"{null_stats.null_ids} transaction_ids nulos")
+        # Suite CRITICO (bloqueante)
+        critical = _execute_gx_suite(engine, "transactions_critical_suite")
+        if not critical['success']:
+            details = "\n".join(critical['failed_expectations'])
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO audit.gx_validation_logs
+                    (table_name, expectation_suite_name, total_records,
+                    failed_records, success_rate, critical_failures, blocking_triggered)
+                    VALUES ('audit.raw_transactions', 'transactions_critical_suite',
+                            :total, :failed, :rate, :failures, TRUE)
+                """), {
+                    'total': critical['total_expectations'],
+                    'failed': critical['failed_count'],
+                    'rate': critical['success_rate'],
+                    'failures': critical['failed_expectations']
+                })
+            raise AirflowFailException(f"{critical['failed_count']} validaciones criticas fallaron:\n{details}")
 
-        # -------------------------------------------------------------------------
-        # VALIDACIÓN 2: Great Expectations (suites CRITICAL y WARNINGS)
-        # -------------------------------------------------------------------------
-        logger.info("🧪 Ejecutando suites de Great Expectations...")
+        logger.info(f"Suite CRITICO pasado: {critical['passed_count']}/{critical['total_expectations']}")
 
-        try:
-            import great_expectations as gx
-            import json
-            import pandas as pd
-            import os
-            import inspect
-            from great_expectations.dataset.pandas_dataset import PandasDataset
+        # Suite ADVERTENCIA (no bloqueante)
+        warning = _execute_gx_suite(engine, "transactions_warning_suite")
+        if not warning['success']:
+            logger.warning(f"{warning['failed_count']} advertencias fallaron (pipeline continua)")
 
-            # Definir rutas de búsqueda para los archivos de suite
-            suite_files = {
-                'critical': [
-                    "/opt/airflow/gx/expectations/transactions_critical_suite.json",
-                    os.path.join(os.getcwd(), "gx/expectations/transactions_critical_suite.json"),
-                    "gx/expectations/transactions_critical_suite.json",
-                    "./gx/expectations/transactions_critical_suite.json"
-                ],
-                'warnings': [
-                    "/opt/airflow/gx/expectations/transactions_warnings_suite.json",
-                    os.path.join(os.getcwd(), "gx/expectations/transactions_warnings_suite.json"),
-                    "gx/expectations/transactions_warnings_suite.json",
-                    "./gx/expectations/transactions_warnings_suite.json"
-                ]
-            }
+        total = critical['total_expectations'] + warning['total_expectations']
+        failed = critical['failed_count'] + warning['failed_count']
+        rate = ((total - failed) / total * 100) if total > 0 else 0
 
-            # Cargar datos una sola vez (para ambas suites)
-            logger.info("📊 Leyendo datos de audit.raw_transactions para validar...")
-            query = "SELECT * FROM audit.raw_transactions"
-            df = pd.read_sql(query, con=engine)
-            total_records = len(df)
-            logger.info(f"📊 Total de registros a validar: {total_records}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO audit.gx_validation_logs
+                (table_name, expectation_suite_name, total_records,
+                failed_records, success_rate, critical_failures)
+                VALUES ('audit.raw_transactions', 'COMBINED_SUITES', :total, :failed, :rate, :failures)
+            """), {
+                'total': total, 'failed': failed, 'rate': rate,
+                'failures': warning['failed_expectations'] if not warning['success'] else []
+            })
 
-            if total_records == 0:
-                logger.warning("⚠️ No hay registros en audit.raw_transactions para validar")
-                return True
+        return {
+            'audit_passed': True,
+            'critical_suite_success': critical['success'],
+            'warning_suite_success': warning['success'],
+            'total_expectations': total,
+            'total_failed': failed,
+            'success_rate': rate
+        }
 
-            # Crear validador una sola vez
-            validator = PandasDataset(df)
-            logger.info("✅ Validador GX creado con PandasDataset")
 
-            # Estructura para almacenar resultados
-            overall_results = {
-                'critical': {'passed': 0, 'failed': 0, 'details': []},
-                'warnings': {'passed': 0, 'failed': 0, 'details': []}
-            }
+    def _execute_gx_suite(engine, suite_name: str) -> Dict[str, Any]:
+        """Ejecuta un suite GX desde archivo JSON."""
+        import os, json, inspect, pandas as pd
+        from great_expectations.dataset.pandas_dataset import PandasDataset
 
-            # Función auxiliar para ejecutar una suite
-            def execute_suite(suite_type: str, suite_paths: List[str]) -> None:
-                """Ejecuta las expectativas de una suite (CRITICAL o WARNINGS)"""
-                
-                # Buscar archivo de suite
-                suite_path = None
-                for path in suite_paths:
-                    if os.path.exists(path):
-                        suite_path = path
-                        logger.info(f"📂 Suite {suite_type} encontrada en: {path}")
-                        break
+        paths = [
+            f"/opt/airflow/gx/expectations/{suite_name}.json",
+            f"gx/expectations/{suite_name}.json",
+        ]
+        suite_path = next((p for p in paths if os.path.exists(p)), None)
+        if not suite_path:
+            return {'success': False, 'total_expectations': 0, 'passed_count': 0,
+                    'failed_count': 0, 'success_rate': 0,
+                    'failed_expectations': [f"Suite no encontrado: {suite_name}"]}
 
-                if suite_path is None:
-                    logger.warning(f"⚠️ No se encontró suite {suite_type} en las rutas esperadas")
-                    return
+        with open(suite_path, 'r') as f:
+            suite_dict = json.load(f)
+        expectations = suite_dict.get('expectations', [])
+        df = pd.read_sql("SELECT * FROM audit.raw_transactions", engine)
 
-                # Cargar suite desde JSON
-                try:
-                    with open(suite_path, 'r') as f:
-                        suite_dict = json.load(f)
-                except (FileNotFoundError, IOError, json.JSONDecodeError) as io_err:
-                    logger.warning(f"⚠️ Error leyendo suite {suite_type}: {str(io_err)[:100]}")
-                    return
+        if len(df) == 0:
+            return {'success': False, 'total_expectations': len(expectations),
+                    'passed_count': 0, 'failed_count': len(expectations),
+                    'success_rate': 0, 'failed_expectations': ["Sin datos"]}
 
-                suite_name = suite_dict.get('expectation_suite_name', f'transactions_{suite_type}_suite')
-                expectations = suite_dict.get('expectations', []) or []
-                logger.info(f"\n{'='*60}")
-                logger.info(f"🔍 Ejecutando suite {suite_type.upper()}: '{suite_name}'")
-                logger.info(f"   Total de expectativas: {len(expectations)}")
-                logger.info(f"{'='*60}")
+        validator = PandasDataset(df)
+        failed, passed = [], []
 
-                # Ejecutar cada expectativa
-                for idx, expectation in enumerate(expectations, 1):
-                    expectation_type = expectation.get('expectation_type')
-                    kwargs = expectation.get('kwargs', {}) or {}
-                    meta = expectation.get('meta', {})
-                    description = meta.get('description', expectation_type)
-                    severity = meta.get('severity', 'INFO')
-
-                    try:
-                        if not expectation_type:
-                            raise ValueError("Expectation sin expectation_type")
-
-                        # Obtener el método del validador
-                        method = getattr(validator, expectation_type, None)
-                        if method is None:
-                            raise AttributeError(f"Expectation no soportada: {expectation_type}")
-
-                        # Filtrar parámetros soportados por el método
-                        supported_params = set(inspect.signature(method).parameters.keys())
-                        supported_kwargs = {k: v for k, v in kwargs.items() if k in supported_params}
-
-                        # Ejecutar expectativa
-                        result = method(**supported_kwargs)
-                        success = result.get('success', False)
-                        unexpected_count = result.get('result', {}).get('unexpected_count', 0)
-
-                        if success:
-                            logger.info(f"  [{idx}] ✅ {description}")
-                            overall_results[suite_type]['passed'] += 1
-                        else:
-                            icon = "⛔" if severity == "CRITICAL" else "⚠️"
-                            logger.warning(f"  [{idx}] {icon} {description} [{severity}]")
-                            logger.warning(f"       └─ {unexpected_count} registros no cumplen")
-                            overall_results[suite_type]['failed'] += 1
-                            overall_results[suite_type]['details'].append({
-                                'expectation': expectation_type,
-                                'description': description,
-                                'severity': severity,
-                                'unexpected_count': unexpected_count
-                            })
-
-                    except Exception as exp_error:
-                        logger.warning(f"  [{idx}] ❌ Error en {expectation_type}: {str(exp_error)[:80]}")
-                        overall_results[suite_type]['failed'] += 1
-
-                # Resumen de suite
-                passed = overall_results[suite_type]['passed']
-                failed = overall_results[suite_type]['failed']
-                total = passed + failed
-                success_rate = (passed / total * 100) if total > 0 else 0
-
-                logger.info(f"\n{'─'*60}")
-                logger.info(f"📊 RESUMEN SUITE {suite_type.upper()}")
-                logger.info(f"  ✅ Pasadas:  {passed}/{total}")
-                logger.info(f"  ❌ Fallidas: {failed}/{total}")
-                logger.info(f"  📈 Éxito:    {success_rate:.1f}%")
-                logger.info(f"{'─'*60}\n")
-
-            # Ejecutar ambas suites
-            execute_suite('critical', suite_files['critical'])
-            execute_suite('warnings', suite_files['warnings'])
-
-            # Registrar resultados en tabla de logs
-            total_passed = overall_results['critical']['passed'] + overall_results['warnings']['passed']
-            total_failed = overall_results['critical']['failed'] + overall_results['warnings']['failed']
-            total_expectations = total_passed + total_failed
-
-            if total_expectations > 0:
-                overall_success_rate = (total_passed / total_expectations * 100)
-            else:
-                overall_success_rate = 0
-
+        for exp in expectations:
+            etype = exp.get('expectation_type')
+            kwargs = exp.get('kwargs', {}) or {}
+            desc = exp.get('meta', {}).get('description', etype)
+            sev = exp.get('meta', {}).get('severity', '?')
             try:
-                with engine.begin() as conn:
-                    conn.execute(text("""
-                        INSERT INTO audit.gx_validation_logs
-                        (table_name, expectation_suite_name, total_records,
-                        failed_records, success_rate, critical_failures)
-                        VALUES (:table_name, :expectation_suite_name, :total_records,
-                        :failed_records, :success_rate, :critical_failures)
-                    """), {
-                        "table_name": "audit.raw_transactions",
-                        "expectation_suite_name": "transactions_critical_suite + transactions_warnings_suite",
-                        "total_records": total_expectations,
-                        "failed_records": total_failed,
-                        "success_rate": overall_success_rate,
-                        "critical_failures": [json.dumps(item) for item in overall_results['critical']['details']]
-                    })
-            except Exception as db_err:
-                logger.warning(f"⚠️ No se pudo registrar en gx_validation_logs: {str(db_err)[:100]}")
+                method = getattr(validator, etype, None)
+                if not method:
+                    raise AttributeError(f"No soportada: {etype}")
+                sig = set(inspect.signature(method).parameters.keys())
+                result = method(**{k: v for k, v in kwargs.items() if k in sig})
+                if result.get('success'):
+                    logger.info(f"  [{sev}] {desc}")
+                    passed.append(etype)
+                else:
+                    uc = result.get('result', {}).get('unexpected_count', 0)
+                    logger.warning(f"  [{sev}] {desc} ({uc} fallan)")
+                    failed.append(f"[{sev}] {desc}: {uc} registros")
+            except Exception as e:
+                failed.append(f"{etype} (error)")
 
-            # Resumen final
-            logger.info(f"\n{'='*60}")
-            logger.info(f"📊 RESUMEN FINAL DE VALIDACIÓN")
-            logger.info(f"{'='*60}")
-            logger.info(f"  CRITICAL - ✅: {overall_results['critical']['passed']} | ❌: {overall_results['critical']['failed']}")
-            logger.info(f"  WARNINGS - ✅: {overall_results['warnings']['passed']} | ❌: {overall_results['warnings']['failed']}")
-            logger.info(f"  ─────────────────────────────────────")
-            logger.info(f"  TOTAL    - ✅: {total_passed} | ❌: {total_failed}")
-            logger.info(f"  Tasa de éxito: {overall_success_rate:.1f}%")
-            logger.info(f"{'='*60}")
-
-            if overall_results['critical']['failed'] > 0:
-                logger.warning(f"⚠️ {overall_results['critical']['failed']} validaciones CRITICAL fallaron")
-                logger.warning(f"   Pero el pipeline continúa (patrón WAP tolerante)")
-
-            logger.info("✅ Fase AUDIT completada - Pipeline puede continuar")
-            return True
-
-        except ImportError as ie:
-            logger.warning(f"⚠️ Error importando Great Expectations: {str(ie)[:100]}")
-            logger.warning("⚠️ Continuando sin validaciones avanzadas...")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Error en validación GX: {str(e)[:200]}")
-            logger.warning("⚠️ Continuando pipeline a pesar del error")
-            return True
+        rate = (len(passed) / len(expectations) * 100) if expectations else 0
+        return {
+            'success': len(failed) == 0,
+            'total_expectations': len(expectations),
+            'passed_count': len(passed),
+            'failed_count': len(failed),
+            'success_rate': rate,
+            'failed_expectations': failed
+        }
 
     # -------------------------------------------------------------------------
     # FASE 3: PUBLISH - Transformación y carga a esquema PROD con Spark
     # -------------------------------------------------------------------------
     @task(task_id='publish_with_spark')
-    def publish_with_spark(audit_passed: bool) -> Dict[str, int]:
+    def publish_with_spark(audit_result) -> Dict[str, int]:
         """
-        Usa Spark para transformar datos y cargarlos al esquema prod.
-        Solo se ejecuta si la auditoría fue exitosa.
-
-        Args:
-            audit_passed: Resultado de la fase de auditoría
-
-        Returns:
-            Dict con métricas de la publicación
+        Usa Spark para transformar datos, aplicar enmascaramiento de PII
+        y cargarlos al esquema prod.
         """
-        if audit_passed is None:
-            logger.warning("⚠️ No se recibió el resultado de auditoría. Si ejecutas esta tarea aisladamente, el DAG completo no fue disparado.")
-            logger.warning("⚠️ Saltando fase PUBLISH para evitar publicar sin una auditoría previa.")
+        if audit_result is None:
             return {'records_published': 0, 'reason': 'audit_result_missing'}
 
-        if not audit_passed:
-            logger.warning("⚠️ Auditoría fallida, saltando fase PUBLISH")
+        if isinstance(audit_result, dict):
+            audit_ok = audit_result.get('audit_passed', False)
+        else:
+            audit_ok = bool(audit_result)
+
+        if not audit_ok:
+            logger.error("Auditoria fallida, NO se publican datos")
             return {'records_published': 0, 'reason': 'audit_failed'}
 
-        logger.info("🚀 Iniciando fase PUBLISH: Transformación con Spark")
+        logger.info(" Iniciando fase PUBLISH: Transformación y enmascaramiento con Spark")
 
-        # Configuración de Spark
         try:
             from pyspark.sql import SparkSession
-            from pyspark.sql.functions import col, when, lit, current_timestamp
+            from pyspark.sql.functions import col, lit, current_timestamp
         except ImportError as ie:
-            logger.error("❌ pyspark no está instalado en el entorno de Airflow. Reconstruye la imagen Docker y reinicia los servicios.")
+            logger.error(" pyspark no está instalado en el entorno de Airflow.")
             raise
 
         spark = SparkSession.builder \
-            .appName("ETL_Publish_WAP") \
+            .appName("ETL_Publish_WAP_Masked") \
             .master("local[*]") \
             .config("spark.driver.extraClassPath", "/opt/spark-jars/postgresql-42.5.0.jar") \
             .config("spark.executor.extraClassPath", "/opt/spark-jars/postgresql-42.5.0.jar") \
             .getOrCreate()
 
         try:
-            # Propiedades de conexión JDBC
             jdbc_properties = {
                 "user": DB_CONFIG['user'],
                 "password": DB_CONFIG['password'],
@@ -502,67 +384,58 @@ def taller_etl_unl_wap():
             }
             jdbc_url = f"jdbc:postgresql://{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
 
-            # Leer datos del esquema audit
-            logger.info("📥 Leyendo datos desde audit.raw_transactions")
+            # Leer datos desde audit
+            logger.info(" Leyendo datos desde audit.raw_transactions")
             df_audit = spark.read.jdbc(
                 url=jdbc_url,
                 table="audit.raw_transactions",
                 properties=jdbc_properties
             )
-
             total_records = df_audit.count()
-            logger.info(f"📊 Registros en audit: {total_records}")
+            logger.info(f" Registros en audit: {total_records}")
 
-            # -------------------------------------------------------------------------
-            # TRANSFORMACIONES DE CALIDAD
-            # -------------------------------------------------------------------------
-            logger.info("🔧 Aplicando transformaciones de limpieza...")
-
-            # 1. Filtrar transacciones completadas y con monto válido
+            # Limpieza básica
             df_clean = df_audit.filter(
                 (col("status") == "COMPLETED") &
                 (col("amount") > 0) &
                 (col("user_id").isNotNull())
             )
 
-            # 2. Añadir columnas de enriquecimiento
             df_enriched = df_clean.withColumn(
-                "data_quality_score",
-                lit(1.0)  # En producción: calcular score basado en reglas
+                "data_quality_score", lit(1.0)
             ).withColumn(
-                "processed_at",
-                current_timestamp()
+                "processed_at", current_timestamp()
             )
 
-            # 3. Ofuscar PII si fuera necesario (ejemplo: hash de user_id)
-            # from pyspark.sql.functions import sha2
-            # df_enriched = df_enriched.withColumn(
-            #     "user_id_hashed",
-            #     sha2(col("user_id").cast("string"), 256)
-            # )
+            # ========== APLICAR ENMASCARAMIENTO ==========
+            try:
+                logger.info(" Aplicando enmascaramiento de transaction_id...")
+                rules = load_masking_rules("/opt/airflow/config/masking_rules.json")
+                df_masked = apply_masking(df_enriched, rules)
+                logger.info(" Enmascaramiento aplicado correctamente")
+            except Exception as e:
+                logger.error(f" Falló el enmascaramiento: {e}")
+                raise
 
-            # -------------------------------------------------------------------------
-            # CARGA A PRODUCCIÓN
-            # -------------------------------------------------------------------------
-            logger.info("📤 Preparando datos nuevos para prod.raw_transactions")
-
+            # Evitar duplicados y cargar a prod
+            logger.info(" Preparando datos nuevos para prod.raw_transactions")
             df_prod_existing = spark.read.jdbc(
                 url=jdbc_url,
                 table="prod.raw_transactions",
                 properties=jdbc_properties
             ).select("transaction_id")
 
-            df_to_publish = df_enriched.dropDuplicates(["transaction_id"]).join(
+            df_to_publish = df_masked.dropDuplicates(["transaction_id"]).join(
                 df_prod_existing,
                 on="transaction_id",
                 how="left_anti"
             )
 
             new_records = df_to_publish.count()
-            duplicate_records = df_enriched.dropDuplicates(["transaction_id"]).count() - new_records
+            duplicate_records = df_masked.dropDuplicates(["transaction_id"]).count() - new_records
 
             if new_records == 0:
-                logger.info("⚠️ No hay registros nuevos para publicar en prod.raw_transactions.")
+                logger.info(" No hay registros nuevos para publicar.")
                 return {
                     'records_published': 0,
                     'records_filtered': total_records,
@@ -570,8 +443,7 @@ def taller_etl_unl_wap():
                     'approval_rate': 0
                 }
 
-            logger.info(f"📤 Publicando {new_records} registros nuevos en prod.raw_transactions")
-
+            logger.info(f"Publicando {new_records} registros enmascarados en prod.raw_transactions")
             df_to_publish.write.jdbc(
                 url=jdbc_url,
                 table="prod.raw_transactions",
@@ -582,11 +454,10 @@ def taller_etl_unl_wap():
             published_count = new_records
             filtered_count = total_records - published_count
 
-            logger.info(f"✅ Fase PUBLISH completada:")
-            logger.info(f"   • Registros publicados: {published_count}")
-            logger.info(f"   • Registros filtrados: {filtered_count}")
-            logger.info(f"   • Registros duplicados evitados: {duplicate_records}")
-            logger.info(f"   • Tasa de aprobación: {published_count/total_records*100:.1f}%")
+            logger.info(f"Fase PUBLISH completada con masking:")
+            logger.info(f"   • Publicados: {published_count}")
+            logger.info(f"   • Filtrados: {filtered_count}")
+            logger.info(f"   • Duplicados evitados: {duplicate_records}")
 
             return {
                 'records_published': published_count,
@@ -597,7 +468,8 @@ def taller_etl_unl_wap():
 
         finally:
             spark.stop()
-            logger.info("🛑 Sesión de Spark cerrada")
+            logger.info("Sesión de Spark cerrada")
+
 
     # -------------------------------------------------------------------------
     # FASE 4: DBT - Materialización de modelos analíticos
@@ -618,10 +490,10 @@ def taller_etl_unl_wap():
         logger.info("🔄 Iniciando fase DBT: Materialización de modelos")
 
         dbt_dir = "/opt/airflow/dbt/proyecto_unl"
-        dbt_profiles_dir = "/opt/airflow/dbt"
+        profiles_dir = "/opt/airflow/dbt"
 
         # Comando dbt seguro (sin shell=True)
-        cmd = ["dbt", "run", "--profiles-dir", dbt_profiles_dir, "--target", "prod"]
+        cmd = ["dbt", "run", "--profiles-dir", profiles_dir, "--target", "prod"]
 
         try:
             result = subprocess.run(
@@ -649,16 +521,108 @@ def taller_etl_unl_wap():
         except FileNotFoundError:
             logger.error("❌ Comando 'dbt' no encontrado. Verificar instalación en Dockerfile")
             raise
+        
+    
 
+    @task(task_id='monitor_freshness')
+    def monitor_freshness() -> Dict[str, Any]:
+        """Monitorea si los datos llegaron a tiempo."""
+        logger.info("Monitoreando frescura de datos")
+        engine = create_engine(DB_URI)
+
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT MAX(ingested_at) as last_ingestion
+                FROM audit.raw_transactions
+                WHERE ingested_at >= NOW() - INTERVAL '24 hours'
+            """))
+            row = result.fetchone()
+            last = row[0]
+
+            if last:
+                lag_h = (datetime.now() - last).total_seconds() / 3600
+                status = 'FRESH' if lag_h < 2 else ('STALE' if lag_h < 6 else 'MISSING')
+            else:
+                lag_h = None
+                status = 'MISSING'
+
+            conn.execute(text("""
+                INSERT INTO audit.data_freshness_monitor
+                (table_name, expected_arrival_time, actual_arrival_time,
+                freshness_lag, status, threshold_minutes)
+                VALUES ('audit.raw_transactions', :expected, :actual, :lag, :status, 120)
+            """), {
+                'expected': datetime.now() - timedelta(hours=2),
+                'actual': last,
+                'lag': f'{lag_h} hours' if lag_h else None,
+                'status': status
+            })
+
+            if status in ['STALE', 'MISSING']:
+                logger.warning(f"ALERTA FRESCURA: {status} - {lag_h}h desde ultima ingesta")
+
+            return {'status': status, 'lag_hours': lag_h}
+
+    
+    @task(task_id='record_lineage', trigger_rule='all_done')
+    def record_lineage(audit_result=None, publish_result=None, dbt_result=None):
+        """Registra el linaje de la ejecucion actual."""
+        import uuid
+        from sqlalchemy import create_engine, text
+        import os
+
+        engine = create_engine(DB_URI)
+        exec_id = str(uuid.uuid4())[:8]
+
+        nodes = [
+            ('API Transacciones', 'source', None, None, 'Fuente externa de datos'),
+            ('audit.raw_transactions', 'table', 'audit', 'raw_transactions', 'Datos crudos de API'),
+            ('prod.raw_transactions', 'table', 'prod', 'raw_transactions', 'Datos validados con Spark'),
+            ('stg_raw_transactions', 'model', 'staging', 'stg_raw_transactions', 'Modelo dbt staging'),
+            ('int_transactions_enriched', 'model', 'intermediate', 'int_transactions_enriched', 'Modelo dbt enriquecido'),
+            ('fct_transactions', 'model', 'analytics', 'fct_transactions', 'Tabla de hechos'),
+            ('dim_users', 'model', 'analytics', 'dim_users', 'Dimension usuarios'),
+        ]
+
+        edges = [
+            ('API Transacciones', 'audit.raw_transactions', 'Extraccion con paginacion'),
+            ('audit.raw_transactions', 'prod.raw_transactions', 'Spark: filtro COMPLETED, amount>0'),
+            ('prod.raw_transactions', 'stg_raw_transactions', 'dbt: estandarizacion'),
+            ('stg_raw_transactions', 'int_transactions_enriched', 'dbt: metricas historicas'),
+            ('int_transactions_enriched', 'fct_transactions', 'dbt: filtro calidad >= 0.7'),
+            ('int_transactions_enriched', 'dim_users', 'dbt: agregacion por usuario'),
+        ]
+
+        with engine.begin() as conn:
+            for name, ntype, schema, table, desc in nodes:
+                nid = f"{schema}.{table}" if schema and table else name
+                conn.execute(text("""
+                    INSERT INTO audit.data_lineage
+                    (lineage_type, node_id, node_name, node_type, schema_name, table_name, description, dag_execution_id)
+                    VALUES ('node', :nid, :name, :type, :schema, :table, :desc, :exec_id)
+                """), {'nid': nid, 'name': name, 'type': ntype, 'schema': schema, 'table': table, 'desc': desc, 'exec_id': exec_id})
+
+            for src, tgt, transform in edges:
+                conn.execute(text("""
+                    INSERT INTO audit.data_lineage
+                    (lineage_type, source_id, target_id, transformation, dag_execution_id)
+                    VALUES ('edge', :src, :tgt, :transform, :exec_id)
+                """), {'src': src, 'tgt': tgt, 'transform': transform, 'exec_id': exec_id})
+
+        logger.info(f"Linaje registrado: ejecucion {exec_id}")
+        return {'execution_id': exec_id}
+    
     # -------------------------------------------------------------------------
     # DEFINIR FLUJO DE TAREAS (DAG)
     # -------------------------------------------------------------------------
 
     # Ejecutar fases en secuencia con paso de métricas entre tareas
     extract_result = write_to_audit()
+    freshness = monitor_freshness()
     audit_result = audit_with_gx(extract_result)
     publish_result = publish_with_spark(audit_result)
     dbt_result = materialize_with_dbt(publish_result)
+    record_lineage(audit_result, publish_result, dbt_result)
 
     # El DAG retorna el resultado final para logging
     return {"status": "completed", "timestamp": datetime.now().isoformat()}

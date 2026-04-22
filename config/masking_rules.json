@@ -1,0 +1,12 @@
+{
+  "fields":{
+      "transaction_id": {
+          "type": "mask_transaction_id",
+          "params":{
+              "visible_digits": 4,
+              "mask_char": "*"
+          }
+      }
+  },
+  "default_action": "keep_original"
+}

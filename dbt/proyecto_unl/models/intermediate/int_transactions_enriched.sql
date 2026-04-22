@@ -1,84 +1,95 @@
-WITH base_transactions AS (
-    SELECT * FROM {{ ref('stg_raw_transactions') }}
-),
+{{
+    config(
+        materialized='view',
+        schema='intermediate',
+        tags=['intermediate', 'enrichment']
+    )
+}}
+
+WITH stg AS (SELECT * FROM {{ ref('stg_raw_transactions') }}),
+
 user_metrics AS (
-    -- Métricas históricas por usuario
     SELECT
         user_id,
         COUNT(*) AS total_transactions,
-        AVG(amount) AS avg_transaction_amount,
-        MAX(amount) AS max_transaction_amount,
-        MIN(amount) AS min_transaction_amount,
+        COUNT(DISTINCT DATE(transaction_date)) AS active_days,
         COUNT(DISTINCT product_category) AS unique_categories,
+        SUM(amount) AS total_amount,
+        AVG(amount) AS avg_transaction_amount,
+        MIN(amount) AS min_transaction_amount,
+        MAX(amount) AS max_transaction_amount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS median_transaction_amount,
+        STDDEV(amount) AS stddev_transaction_amount,
+        MIN(transaction_date) AS first_transaction_date,
         MAX(transaction_date) AS last_transaction_date,
-        DATE_PART('day', MAX(transaction_date) - MIN(transaction_date)) AS user_lifespan_days,
-        AVG(data_quality_score) AS avg_data_quality_score
-    FROM base_transactions
+        NTILE(4) OVER (ORDER BY SUM(amount) DESC) AS user_value_quartile,
+        NTILE(4) OVER (ORDER BY COUNT(*) DESC) AS user_frequency_quartile
+    FROM stg WHERE status = 'COMPLETED'
     GROUP BY user_id
 ),
+
 category_metrics AS (
-    -- Métricas por categoría de producto
     SELECT
         product_category,
         COUNT(*) AS category_total_transactions,
+        SUM(amount) AS category_total_amount,
         AVG(amount) AS category_avg_amount,
-        STDDEV(amount) AS category_amount_stddev,
-        AVG(data_quality_score) AS category_avg_quality
-    FROM base_transactions
+        COUNT(DISTINCT user_id) AS category_unique_users
+    FROM stg WHERE status = 'COMPLETED'
     GROUP BY product_category
 ),
-enriched AS (
+
+daily_metrics AS (
     SELECT
-        t.transaction_id,
-        t.user_id,
-        t.product_category,
-        t.amount,
-        t.currency,
-        t.transaction_date,
-        t.status,
-        t.data_quality_score,
-        t.data_quality_tier,
-        t.transaction_value_tier,
-
-        -- Métricas del usuario
-        u.total_transactions,
-        u.avg_transaction_amount,
-        u.max_transaction_amount,
-        u.min_transaction_amount,
-        u.unique_categories,
-        u.last_transaction_date,
-        u.user_lifespan_days,
-        u.avg_data_quality_score,
-
-        -- Métricas de la categoría
-        c.category_total_transactions,
-        c.category_avg_amount,
-        c.category_amount_stddev,
-        c.category_avg_quality,
-
-        -- Cálculos adicionales
-        t.amount / NULLIF(u.avg_transaction_amount, 0) AS amount_vs_user_avg,
-        t.amount / NULLIF(c.category_avg_amount, 0) AS amount_vs_category_avg,
-
-        -- Puntaje de confiabilidad compuesto
-        CASE
-            WHEN t.data_quality_score >= 0.8
-                 AND t.amount BETWEEN (u.avg_transaction_amount - u.avg_transaction_amount * 0.5)
-                                  AND (u.avg_transaction_amount + u.avg_transaction_amount * 0.5)
-                 AND t.amount BETWEEN (c.category_avg_amount - c.category_amount_stddev * 2)
-                                  AND (c.category_avg_amount + c.category_amount_stddev * 2)
-            THEN 0.9
-            WHEN t.data_quality_score >= 0.6
-                 AND t.amount BETWEEN (u.avg_transaction_amount - u.avg_transaction_amount * 0.8)
-                                  AND (u.avg_transaction_amount + u.avg_transaction_amount * 0.8)
-            THEN 0.7
-            WHEN t.data_quality_score >= 0.4
-            THEN 0.5
-            ELSE 0.3
-        END AS composite_reliability_score
-
-    FROM base_transactions t
-    LEFT JOIN user_metrics u ON t.user_id = u.user_id
-    LEFT JOIN category_metrics c ON t.product_category = c.product_category
+        transaction_day,
+        COUNT(*) AS daily_transaction_count,
+        SUM(amount) AS daily_total_amount,
+        AVG(amount) AS daily_avg_amount,
+        COUNT(DISTINCT user_id) AS daily_unique_users,
+        AVG(SUM(amount)) OVER (
+            ORDER BY transaction_day
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        ) AS daily_amount_7day_moving_avg
+    FROM stg WHERE status = 'COMPLETED'
+    GROUP BY transaction_day
 )
-SELECT * FROM enriched
+
+SELECT
+    t.*,
+    um.total_transactions AS user_total_transactions,
+    um.active_days AS user_active_days,
+    um.unique_categories AS user_unique_categories,
+    um.total_amount AS user_total_amount,
+    um.avg_transaction_amount AS user_avg_transaction_amount,
+    um.median_transaction_amount AS user_median_transaction_amount,
+    um.stddev_transaction_amount AS user_stddev_transaction_amount,
+    um.user_value_quartile,
+    um.user_frequency_quartile,
+    cm.category_total_transactions,
+    cm.category_total_amount,
+    cm.category_avg_amount,
+    cm.category_unique_users,
+    dm.daily_transaction_count,
+    dm.daily_total_amount,
+    dm.daily_avg_amount,
+    dm.daily_unique_users,
+    dm.daily_amount_7day_moving_avg,
+    CASE WHEN um.avg_transaction_amount > 0
+        THEN ROUND((t.amount - um.avg_transaction_amount) / um.avg_transaction_amount * 100, 2)
+        ELSE NULL
+    END AS deviation_from_user_avg_pct,
+    CASE WHEN dm.daily_avg_amount > 0
+        THEN ROUND((t.amount - dm.daily_avg_amount) / dm.daily_avg_amount * 100, 2)
+        ELSE NULL
+    END AS deviation_from_daily_avg_pct,
+    ROUND(
+        (t.data_quality_score * 0.4) +
+        (CASE WHEN um.total_transactions > 10 THEN 0.3 ELSE 0.1 END) +
+        (CASE WHEN t.amount > cm.category_avg_amount THEN 0.3 ELSE 0.1 END)
+    , 2) AS composite_reliability_score
+FROM stg t
+LEFT JOIN user_metrics um ON t.user_id = um.user_id
+LEFT JOIN category_metrics cm ON t.product_category = cm.product_category
+LEFT JOIN daily_metrics dm ON t.transaction_day = dm.transaction_day
+
+

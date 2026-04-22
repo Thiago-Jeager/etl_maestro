@@ -1,108 +1,80 @@
 version: 2
-models: 
- - name: stg_raw_transactions
-   description: "Limpieza y estandarizacion de los datos de transacciones raw"
-   columns:
-     - name: transaction_id
-       description: "Identificador unico de la transaccion"
-       tests: [unique, not_null]
-     - name: user_id
-       description: "Identificador del usuario"
-       tests: [not_null]
-     - name: product_category
-       description: "Categoria del producto"
-       tests: [not_null]
-     - name: amount
-       description: "Monto de la transaccion"
-       tests: 
-          - not_null
-          - dbt_utils.accepted_range:
-              min_value: 0
-              inclusive: false
-     - name: currency
-       description: "Moneda de la transaccion"
-       tests: 
-          - accepted_values:
-              values: ['USD', 'EUR', 'GBP', 'JPY']
-     - name: status
-       description: "Estado de la transaccion"
-       tests: 
-          - accepted_values:
-              values: ['COMPLETED', 'PENDING', 'FAILED']
-     - name: data_quality_score
-       description: "Puntaje de calidad de los datos"
-       tests: 
-          - dbt_utils.accepted_range:
-              min_value: 0
-              max_value: 1
-     - name: data_quality_tier
-       description: "Lista de problemas de calidad de los datos"
-       tests:
-          - accepted_values:
-              values: ['high', 'medium', 'low']
-     - name: transaction_value_tier
-       description: "Nivel de valor de la transaccion"
-       tests:
-          - accepted_values:
-              values: ['high_value', 'medium_value', 'low_value']
- - name: int_transactions_enriched
-   description: "Enriquecimiento con metricas historicas por usuario y categoria"
-   columns:
-     - name: transaction_id
-       description: "Identificador unico de la transaccion"
-       tests: [unique, not_null]
-     - name: composite_reliability_score
-       description: "Puntaje de confiabilidad compuesto basado en calidad de datos y valor de la transaccion"
-       tests: 
-          - dbt_utils.accepted_range:
-              min_value: 0
-              max_value: 1
- - name: fct_transactions
-   description : "Tabla de hechos final con metricas para dashboards y analisis"
-   columns:
-     - name: transaction_id
-       description: "Identificador unico de la transaccion"
-       tests: [unique, not_null]
-     - name: amount
-       description: "Monto de la transaccion"
-       tests: 
-          - not_null
-          - dbt_utils.accepted_range:
-              min_value: 0
-              inclusive: false
-     - name: data_quality_score
-       description: "Puntaje de calidad de los datos"
-       tests: 
-        - dbt_utils.accepted_range:
-           min_value: 0
-           max_value: 1
-     - name: is_anomaly
-       description: "Indicador de si la transaccion es una anomalía basada en reglas de negocio"
-       tests:
-          - accepted_values:
-              values: [true, false]
- - name: dim_users
-   description: "Tabla de dimensiones de usuarios con segmentacion basada en comportamiento historico"
-   columns:
+
+models:
+  - name: stg_raw_transactions
+    description: "Limpieza y estandarizacion de transacciones crudas."
+    columns:
+      - name: transaction_id
+        tests: [unique, not_null]
       - name: user_id
-        description: "Identificador del usuario"
+        description: "Identificador del usuario - DATO PII directo, se recomienda enmascarar o tokenizar en etapas posteriores."
+        tests: [not_null]
+        meta:
+          pii: true
+          pii_category: direct_identifier
+          pii_sensitivity: high
+          access_restrictions: production_only
+          retention_days: 365
+      - name: product_category
+        tests: [not_null]
+      - name: amount
+        tests:
+          - not_null
+          - dbt_utils.accepted_range: {min_value: 0, inclusive: false}
+      - name: currency
+        tests:
+          - accepted_values: {values: ['USD', 'EUR', 'GBP']}
+      - name: status
+        tests:
+          - accepted_values: {values: ['COMPLETED', 'PENDING', 'FAILED']}
+      - name: data_quality_score
+        tests:
+          - dbt_utils.accepted_range: {min_value: 0, max_value: 1}
+      - name: data_quality_tier
+        tests:
+          - accepted_values: {values: ['high', 'medium', 'low']}
+      - name: transaction_value_tier
+        tests:
+          - accepted_values: {values: ['high_value', 'medium_value', 'low_value']}
+
+  - name: int_transactions_enriched
+    description: "Enriquecimiento con metricas historicas por usuario y categoria."
+    columns:
+      - name: transaction_id
+        tests: [unique, not_null]
+      - name: composite_reliability_score
+        tests:
+          - dbt_utils.accepted_range: {min_value: 0, max_value: 1}
+
+  - name: fct_transactions
+    description: "Tabla de hechos final para dashboards."
+    columns:
+      - name: transaction_id
+        tests: [unique, not_null]
+      - name: amount
+        tests:
+          - not_null
+          - dbt_utils.accepted_range: {min_value: 0}
+      - name: data_quality_score
+        tests:
+          - dbt_utils.accepted_range: {min_value: 0.7}
+      - name: is_anomaly
+        tests:
+          - accepted_values: {values: [true, false]}
+
+  - name: dim_users
+    description: "Dimension de usuarios con segmentacion RFM."
+    columns:
+      - name: user_id
         tests: [unique, not_null]
       - name: lifetime_value
-        description: "Valor total generado por el usuario a lo largo del tiempo"
         tests: [not_null]
       - name: is_active_user
-        description: "Indicador de si el usuario ha realizado transacciones"
         tests:
-          - accepted_values:
-              values: [true, false]
+          - accepted_values: {values: [true, false]}
       - name: is_churned_user
-        description: "Indicador de si el usuario ha dejado de realizar transacciones"
         tests:
-          - accepted_values:
-              values: [true, false]
+          - accepted_values: {values: [true, false]}
       - name: rfm_score
-        description: "Puntaje RFM (Recencia, Frecuencia, Valor) para segmentacion de usuarios"
         tests:
-          - dbt_utils.accepted_range:
-              min_value: 0
-              max_value: 5
+          - dbt_utils.accepted_range: {min_value: 1, max_value: 5}

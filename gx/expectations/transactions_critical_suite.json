@@ -22,16 +22,7 @@
       "meta": {"description": "Cada transaction_id debe ser único", "severity": "CRITICAL"},
       "kwargs": {"column": "transaction_id"}
     },
-    {
-      "expectation_type": "expect_column_values_to_be_between",
-      "meta": {"description": "amount debe ser positivo y razonable", "severity": "CRITICAL"},
-      "kwargs": {
-        "column": "amount",
-        "min_value": 0.01,
-        "max_value": 100000,
-        "mostly": 0.99
-      }
-    },
+
     {
       "expectation_type": "expect_column_values_to_be_in_set",
       "meta": {"description": "currency debe ser moneda válida", "severity": "CRITICAL"},

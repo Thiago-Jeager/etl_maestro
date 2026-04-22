@@ -20,6 +20,7 @@ x-airflow-common: &airflow-common
     DB_HOST: ${DB_HOST}
     DB_NAME: ${DB_NAME}
     DB_PORT: ${DB_PORT}
+    PII_SALT: ${PII_SALT} 
 
     # Definir la conexión a la base de datos warehouse
     AIRFLOW_CONN_POSTGRES_WAREHOUSE_CONN: postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
@@ -37,8 +38,10 @@ x-airflow-common: &airflow-common
     - ./plugins:/opt/airflow/plugins
     - ./dbt:/opt/airflow/dbt  # AGREGAR ESTE VOLUMEN para persistencia
     - ./gx:/opt/airflow/gx  # Volumen para Great Expectations
+    - ./scripts:/opt/airflow/scripts  # Volumen para scripts auxiliares
     - ./data_lake:/opt/airflow/data_lake  # Volumen para datos de entrada/salida
     - ./init_db:/docker-entrypoint-initdb.d # Volumen para scripts de inicialización de la base de datos
+    - ./config:/opt/airflow/config # Volumen para archivos de configuración personalizados (ej. reglas de enmascaramiento)
 
   user: "${AIRFLOW_UID:-50000}:0"
 
