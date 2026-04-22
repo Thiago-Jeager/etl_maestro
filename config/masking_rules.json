@@ -6,6 +6,20 @@
               "visible_digits": 4,
               "mask_char": "*"
           }
+      },
+      "email": {
+          "type": "mask_email",
+          "params": {
+              "visible_digits": 4,
+              "mask_char": "*"
+          }
+      },
+      "ip_address": {
+          "type": "mask_ip_address",
+          "params": {
+              "visible_digits": 3,
+              "mask_char": "*"
+          }
       }
   },
   "default_action": "keep_original"

@@ -1,5 +1,6 @@
 import os
 import json
+from venv import logger
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, sha2, concat, lit, expr, regexp_replace
 
@@ -36,4 +37,38 @@ def apply_masking(df: DataFrame, rules_config: dict) -> DataFrame:
             df_masked = df_masked.withColumn(field, expr(expr_mask))
         else:
             print(f"Regla de enmascaramiento no reconocida: {rule_type}")
+    return df_masked
+
+def apply_masking_users(df: DataFrame, rules_config: dict) -> DataFrame:
+    "Aplicar las reglas de enmascaramiento usando Spark SQL"
+    fields = rules_config.get("fields", {})
+    df_masked = df
+
+    for field, rule in fields.items():
+        if field not in df.columns:
+            continue
+
+        rule_type = rule["type"]
+        params = rule.get("params", {})
+        visible = params.get("visible_digits", 3)
+        mask_char = params.get("mask_char", "*")
+
+        # Expresión genérica (ya que usas la misma lógica para todos)
+        expr_mask = f"""
+            CASE 
+                WHEN {field} IS NULL THEN NULL 
+                ELSE CONCAT (
+                    REPEAT('{mask_char}', GREATEST(0, LENGTH(CAST({field} AS STRING)) - {visible})), 
+                    RIGHT(CAST({field} AS STRING), {visible})
+                )
+            END
+        """
+
+        # Encadenamiento correcto de condiciones
+        if rule_type in ["mask_email", "mask_ip_address", "mask_transaction_id"]:
+            logger.info(f"Aplicando regla {rule_type} al campo: {field}")
+            df_masked = df_masked.withColumn(field, expr(expr_mask))
+        else:
+            logger.warning(f"Regla de enmascaramiento no reconocida: {rule_type}")
+            
     return df_masked

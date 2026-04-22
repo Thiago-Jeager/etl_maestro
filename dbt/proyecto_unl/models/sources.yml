@@ -1,7 +1,54 @@
-version: 1
+version: 2
+
 sources:
   - name: prod_source
+    database: db_warehouse
     schema: prod
+    description: "Fuentes de datos productivos WAP - Transacciones y Usuarios enmascarados"
+    
     tables:
       - name: raw_transactions
+        description: "Transacciones validadas y enmascaradas (Spark PUBLISH phase)"
+        columns:
+          - name: transaction_id
+            description: "Identificador único de transacción"
+            tests:
+              - unique
+              - not_null
+          - name: user_id
+            description: "ID del usuario (referencia a raw_users)"
+            tests:
+              - not_null
+          - name: amount
+            description: "Monto de la transacción"
+            tests:
+              - not_null
+          - name: data_quality_score
+            description: "Score de calidad (0-1)"
+          
+      - name: raw_users
+        description: "Usuarios con PII enmascarado (email y IP en SHA256 - LDPD/GDPR)"
+        columns:
+          - name: user_id
+            description: "Identificador único del usuario"
+            tests:
+              - unique
+              - not_null
+          - name: first_name
+            description: "Nombre del usuario (sin enmascarar en esta tabla de origen)"
+          - name: last_name
+            description: "Apellido del usuario (sin enmascarar en esta tabla de origen)"
+          - name: email_hashed
+            description: "Email con hash SHA256 (LDPD Art. 12)"
+          - name: ip_address_hashed
+            description: "IP con hash SHA256 (GDPR auditoría)"
+          - name: country
+            description: "País del usuario"
+          - name: registration_date
+            description: "Fecha de registro"
+            tests:
+              - not_null
+          - name: data_quality_score
+            description: "Score de calidad de datos (0-1)"
+
     

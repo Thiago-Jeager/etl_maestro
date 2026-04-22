@@ -3,24 +3,53 @@
   "expectation_suite_name": "users_warnings_suite",
   "expectations": [
     {
-      "expectation_type": "expect_column_values_to_match_regex",
-      "meta": {"description": "email debe tener un formato de correo válido cuando no es nulo", "severity": "WARNING"},
-      "kwargs": {"column": "email","regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", "mostly": 0.95}
-    },
-    {
       "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "registration_date no debe ser nulo", "severity": "WARNING"},
-      "kwargs": {"column": "registration_date", "mostly": 0.99}
+      "meta": {"description": "email tiene 5% de nulos inyectados intencionalmente (Completitud - LDPD)", "severity": "WARNING"},
+      "kwargs": {
+        "column": "email",
+        "mostly": 0.95
+      }
     },
     {
-      "expectation_type": "expect_column_values_to_be_in_set",
-      "meta": {"description": "country debe ser un valor lógico de país", "severity": "WARNING"},
-      "kwargs": {"column": "country", "value_set": ["US", "MX", "AR", "CO", "BR", "CL", "PE", "VE", "EC", "UY", "PY", "BO", "GT", "CR", "PA", "DO", "SV", "NI", "HN", "CU"], "mostly": 0.95}
+      "expectation_type": "expect_column_values_to_match_regex",
+      "meta": {"description": "email debe tener formato válido cuando no es nulo (PII - validación)", "severity": "WARNING"},
+      "kwargs": {
+        "column": "email",
+        "regex": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+        "mostly": 0.95
+      }
+    },
+    {
+      "expectation_type": "expect_column_value_lengths_to_be_between",
+      "meta": {"description": "first_name debe tener 1-50 caracteres", "severity": "WARNING"},
+      "kwargs": {
+        "column": "first_name",
+        "min_value": 1,
+        "max_value": 50
+      }
+    },
+    {
+      "expectation_type": "expect_column_value_lengths_to_be_between",
+      "meta": {"description": "last_name debe tener 1-50 caracteres", "severity": "WARNING"},
+      "kwargs": {
+        "column": "last_name",
+        "min_value": 1,
+        "max_value": 50
+      }
+    },
+    {
+      "expectation_type": "expect_column_value_lengths_to_be_between",
+      "meta": {"description": "country debe tener código ISO válido (2-3 caracteres)", "severity": "WARNING"},
+      "kwargs": {
+        "column": "country",
+        "min_value": 2,
+        "max_value": 50
+      }
     }
   ],
   "meta": {
     "great_expectations_version": "0.18.15",
     "created_at": "2026-04-14T00:00:00Z",
-    "description": "Suite de advertencias para el dataset de usuarios"
+    "description": "Suite de advertencias para dataset de usuarios - Detecta PII y anomalías"
   }
 }

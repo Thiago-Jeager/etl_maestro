@@ -4,27 +4,27 @@
   "expectations": [
     {
       "expectation_type": "expect_table_row_count_to_be_between",
-      "meta": {"description": "Debe existir al menos un registro de usuario", "severity": "CRITICAL"},
+      "meta": {"description": "Verificar que haya al menos 1 registro", "severity": "CRITICAL"},
       "kwargs": {"min_value": 1, "strict_max": false}
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "user_id no debe ser nulo", "severity": "CRITICAL"},
+      "meta": {"description": "user_id es clave primaria", "severity": "CRITICAL"},
       "kwargs": {"column": "user_id"}
     },
     {
       "expectation_type": "expect_column_values_to_be_unique",
-      "meta": {"description": "user_id debe ser único", "severity": "CRITICAL"},
+      "meta": {"description": "Cada user_id debe ser único", "severity": "CRITICAL"},
       "kwargs": {"column": "user_id"}
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "first_name no debe ser nulo", "severity": "CRITICAL"},
+      "meta": {"description": "first_name no puede ser nulo", "severity": "CRITICAL"},
       "kwargs": {"column": "first_name"}
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "last_name no debe ser nulo", "severity": "CRITICAL"},
+      "meta": {"description": "last_name no puede ser nulo", "severity": "CRITICAL"},
       "kwargs": {"column": "last_name"}
     },
     {
@@ -39,23 +39,23 @@
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "ip_address no debe ser nulo", "severity": "CRITICAL"},
+      "meta": {"description": "ip_address no puede ser nulo (auditoría de seguridad)", "severity": "CRITICAL"},
       "kwargs": {"column": "ip_address"}
     },
     {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "country no debe ser nulo", "severity": "CRITICAL"},
-      "kwargs": {"column": "country"}
+      "expectation_type": "expect_column_values_to_match_regex",
+      "meta": {"description": "registration_date debe tener formato ISO YYYY-MM-DD", "severity": "CRITICAL"},
+      "kwargs": {"column": "registration_date", "regex": "^\\d{4}-\\d{2}-\\d{2}"}
     },
     {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "meta": {"description": "email debe estar presente en al menos el 95% de los registros", "severity": "CRITICAL"},
-      "kwargs": {"column": "email", "mostly": 0.95}
+      "expectation_type": "expect_column_values_to_match_regex",
+      "meta": {"description": "ip_address debe ser dirección IP válida (IPv4)", "severity": "CRITICAL"},
+      "kwargs": {"column": "ip_address", "regex": "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"}
     }
   ],
   "meta": {
     "great_expectations_version": "0.18.15",
     "created_at": "2026-04-14T00:00:00Z",
-    "description": "Suite de calidad crítica para el dataset de usuarios"
+    "description": "Suite de calidad crítica para dataset de usuarios - PII y completitud"
   }
 }

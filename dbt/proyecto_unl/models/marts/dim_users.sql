@@ -2,48 +2,97 @@
     config(
         materialized='table',
         schema='analytics',
-        tags=['marts', 'dimensions'],
+        tags=['marts', 'dimensions', 'users', 'pii'],
         meta={
             'owner': 'analytics_team',
-            'description': 'Dimension de usuarios con metricas agregadas y segmentacion RFM',
-            'data_classification': 'confidential'
+            'description': 'Dimension de usuarios con metricas, segmentacion RFM y PII enmascarado (LDPD/GDPR)',
+            'data_classification': 'confidential',
+            'pii_hashed': true
         }
     )
 }}
 
-WITH stg AS (SELECT * FROM {{ ref('stg_raw_transactions') }}),
+WITH int_users AS (
+    SELECT * FROM {{ ref('int_users_enriched') }}
+),
 
-user_profile AS (
+user_segment_score AS (
     SELECT
         user_id,
-        COUNT(*) AS total_transactions,
-        COUNT(DISTINCT DATE(transaction_date)) AS active_days,
-        COUNT(DISTINCT product_category) AS unique_categories_purchased,
-        SUM(amount) AS lifetime_value,
-        AVG(amount) AS avg_ticket_size,
-        MIN(amount) AS min_transaction,
-        MAX(amount) AS max_transaction,
-        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS median_transaction,
-        MIN(transaction_date) AS first_seen_date,
-        MAX(transaction_date) AS last_seen_date,
-        EXTRACT(DAY FROM NOW() - MAX(transaction_date)) AS days_since_last_transaction,
-        NTILE(5) OVER (ORDER BY SUM(amount) DESC) AS value_segment,
-        NTILE(5) OVER (ORDER BY COUNT(*) DESC) AS frequency_segment,
-        NTILE(5) OVER (ORDER BY MAX(transaction_date) DESC) AS recency_segment
-    FROM stg WHERE status = 'COMPLETED'
-    GROUP BY user_id
+        -- RFM segmentation basado en transacciones
+        CASE
+            WHEN total_transactions >= 50 AND total_lifetime_value >= 5000 THEN 'VIP_Customer'
+            WHEN total_transactions >= 20 AND total_lifetime_value >= 1000 THEN 'Premium_Customer'
+            WHEN total_transactions >= 5 THEN 'Regular_Customer'
+            WHEN total_transactions > 0 THEN 'One_Time_Buyer'
+            ELSE 'No_Activity'
+        END AS customer_segment,
+        -- Churn risk
+        CASE
+            WHEN days_since_registration IS NULL THEN 'unknown'
+            WHEN user_activity_segment = 'high_activity' THEN 'low_churn_risk'
+            WHEN user_activity_segment = 'medium_activity' THEN 'medium_churn_risk'
+            ELSE 'high_churn_risk'
+        END AS churn_risk_level,
+        -- Engagement score
+        CASE
+            WHEN data_quality_tier = 'high' AND completeness_flag = 'complete' THEN 100
+            WHEN data_quality_tier = 'medium' AND completeness_flag = 'complete' THEN 75
+            WHEN completeness_flag = 'complete' THEN 50
+            ELSE 25
+        END AS engagement_score
+    FROM int_users
 )
 
 SELECT
-    user_id, total_transactions, active_days, unique_categories_purchased,
-    lifetime_value, avg_ticket_size, min_transaction, max_transaction,
-    median_transaction, first_seen_date, last_seen_date,
-    days_since_last_transaction,
-    value_segment, frequency_segment, recency_segment,
-    (value_segment + frequency_segment + recency_segment) / 3.0 AS rfm_score,
-    CASE WHEN days_since_last_transaction <= 30 THEN TRUE ELSE FALSE END AS is_active_user,
-    CASE WHEN days_since_last_transaction > 30 AND days_since_last_transaction <= 90 THEN TRUE ELSE FALSE END AS is_at_risk_user,
-    CASE WHEN days_since_last_transaction > 90 THEN TRUE ELSE FALSE END AS is_churned_user,
+    u.user_id,
+    u.first_name,
+    u.last_name,
+    u.full_name,
+    u.country,
+    u.registration_date,
+    u.registration_year,
+    u.registration_month,
+    -- Métricas de actividad
+    u.total_transactions,
+    u.active_days,
+    u.total_lifetime_value AS lifetime_value,
+    u.avg_transaction_amount,
+    u.last_transaction_date,
+    u.user_activity_segment,
+    -- Flags de estado
+    CASE
+        WHEN u.user_activity_segment IN ('high_activity', 'medium_activity') THEN true
+        ELSE false
+    END AS is_active_user,
+    CASE
+        WHEN seg.churn_risk_level = 'high_churn_risk' THEN true
+        ELSE false
+    END AS is_churned_user,
+    -- Segmentación
+    seg.customer_segment,
+    seg.churn_risk_level,
+    seg.engagement_score,
+    -- RFM Score (1-5 scale)
+    CASE
+        WHEN seg.customer_segment = 'VIP_Customer' THEN 5
+        WHEN seg.customer_segment = 'Premium_Customer' THEN 4
+        WHEN seg.customer_segment = 'Regular_Customer' THEN 3
+        WHEN seg.customer_segment = 'One_Time_Buyer' THEN 2
+        ELSE 1
+    END AS rfm_score,
+    -- Calidad de datos
+    u.data_quality_score,
+    u.data_quality_tier,
+    u.completeness_flag,
+    u.has_missing_email,
+    u.user_trust_level,
+    -- Temporal
+    u.days_since_registration,
+    u.user_age_segment,
+    u.processed_at,
     CURRENT_TIMESTAMP AS dbt_processed_at
-FROM user_profile
-ORDER BY lifetime_value DESC
+FROM int_users u
+INNER JOIN user_segment_score seg ON u.user_id = seg.user_id
+WHERE u.data_quality_score >= 0.7  -- Filtrar por calidad mínima
+ORDER BY u.total_lifetime_value DESC

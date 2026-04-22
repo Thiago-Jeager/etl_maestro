@@ -32,3 +32,16 @@
         ELSE CONCAT(LEFT({{ name_column }}, 1), '***')
     END
 {% endmacro %}
+
+{% macro mask_ip_address(ip_column) %}
+    CASE
+        WHEN {{ ip_column }} IS NULL THEN NULL
+        ELSE 
+            CONCAT(
+                '***.***.',
+                SPLIT_PART({{ ip_column }}, '.', 3),
+                '.',
+                SPLIT_PART({{ ip_column }}, '.', 4)
+            )
+    END
+{% endmacro %}

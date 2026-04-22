@@ -19,7 +19,7 @@ from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.exceptions import AirflowFailException
-from scripts.masking_transform import load_masking_rules, apply_masking
+from scripts.masking_transform import load_masking_rules, apply_masking, apply_masking_users
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -193,13 +193,165 @@ def taller_etl_unl_wap():
 
             page += 1
 
+
+    # -------------------------------------------------------------------------
+        logger.info("🚀 Iniciando fase WRITE USUARIOS: Extracción de API /users")
+
+        pg_hook = PostgresHook(postgres_conn_id='postgres_warehouse_conn')
+
+        # Limpiar tabla de auditoría para usuarios
+        pg_hook.run("TRUNCATE TABLE audit.raw_users;")
+        logger.info("🗑️ Tabla audit.raw_users limpiada")
+
+        # Configurar request
+        url = f"{API_BASE_URL}/users"
+        headers = {"x-api-key": API_KEY}
+
+        # Variables de paginación
+        page = 1
+        total_pages = 1
+        records_inserted = 0
+        errors = 0
+
+        # Loop de paginación con manejo de errores
+        while page <= total_pages:
+            logger.info(f"📄 Solicitando página {page}/{total_pages} de usuarios")
+
+            params = {"page": page, "limit": 100}
+            response_data = fetch_with_retry(url, headers, params)
+
+            if response_data is None:
+                errors += 1
+                logger.warning(f"⚠️ Fallo al obtener página {page} de usuarios, continuando...")
+                page += 1
+                continue
+
+            # Actualizar total de páginas desde metadatos
+            meta = response_data.get('meta', {})
+            total_pages = meta.get('total_pages', 1)
+
+            # Procesar registros de la página
+            for record in response_data.get('data', []):
+                try:
+                    # Insertar en PostgreSQL usando parámetros para evitar SQL injection
+                    sql = """
+                        INSERT INTO audit.raw_users
+                        (user_id, first_name, last_name, email, ip_address, country, registration_date)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """
+                    pg_hook.run(sql, parameters=(
+                        record['user_id'],
+                        record['first_name'],
+                        record['last_name'],
+                        record.get('email'),  # Puede ser None (5% inyectado)
+                        record['ip_address'],
+                        record['country'],
+                        record['registration_date']
+                    ))
+                    records_inserted += 1
+
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"❌ Error insertando registro de usuario {record.get('user_id')}: {e}")
+
+            page += 1
+
         # Log de resumen
-        logger.info(f"✅ Fase WRITE completada: {records_inserted} registros, {errors} errores")
+        logger.info(f"✅ Fase WRITE TRANSACCIONES completada: {records_inserted} registros, {errors} errores")
+        logger.info(f"✅ Fase WRITE USUARIOS completada: {records_inserted} registros, {errors} errores")
 
         return {
             'records_inserted': records_inserted,
             'errors': errors,
             'pages_processed': page - 1
+        }
+
+    # -------------------------------------------------------------------------
+    # FASE 2B: AUDIT USUARIOS - Validación de PII y Completitud con GX
+    # -------------------------------------------------------------------------
+    @task(task_id='audit_users_with_gx')
+    def audit_users_with_gx(extract_users_metrics: Dict[str, int]) -> Dict[str, Any]:
+        """
+        Ejecuta validaciones GX para usuarios:
+        1. Suite CRÍTICO: Valida PII completo y formato (bloquea si falla)
+        2. Suite ADVERTENCIA: Detecta anomalías en email (5% nulos) y otros campos
+        """
+        logger.info("🔍 Iniciando fase AUDIT USUARIOS: Validación GX de PII")
+        engine = create_engine(DB_URI)
+
+        # Chequeos SQL rápidos
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT
+                    COUNT(CASE WHEN user_id IS NULL THEN 1 END) as null_ids,
+                    COUNT(CASE WHEN first_name IS NULL THEN 1 END) as null_first_name,
+                    COUNT(CASE WHEN last_name IS NULL THEN 1 END) as null_last_name,
+                    COUNT(CASE WHEN ip_address IS NULL THEN 1 END) as null_ips,
+                    COUNT(CASE WHEN email IS NULL THEN 1 END) as null_emails,
+                    COUNT(*) as total
+                FROM audit.raw_users
+            """))
+            stats = result.fetchone()
+            
+            logger.info(f"📊 Estadísticas de usuarios:")
+            logger.info(f"  - Total: {stats.total}")
+            logger.info(f"  - Emails nulos (esperado ~5%): {stats.null_emails} ({100*stats.null_emails/stats.total:.1f}%)")
+            
+            if stats.null_ids > 0:
+                raise AirflowFailException(f"{stats.null_ids} registros sin user_id (CRÍTICO)")
+            if stats.null_first_name > 0:
+                raise AirflowFailException(f"{stats.null_first_name} registros sin first_name")
+            if stats.null_ips > 0:
+                raise AirflowFailException(f"{stats.null_ips} registros sin ip_address (auditoría de seguridad)")
+
+        # Suite CRÍTICO para usuarios
+        critical = _execute_gx_suite(engine, "users_critical_suite")
+        if not critical['success']:
+            details = "\n".join(critical['failed_expectations'])
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO audit.gx_validation_logs
+                    (table_name, expectation_suite_name, total_records,
+                    failed_records, success_rate, critical_failures, blocking_triggered)
+                    VALUES ('audit.raw_users', 'users_critical_suite',
+                            :total, :failed, :rate, :failures, TRUE)
+                """), {
+                    'total': critical['total_expectations'],
+                    'failed': critical['failed_count'],
+                    'rate': critical['success_rate'],
+                    'failures': critical['failed_expectations']
+                })
+            raise AirflowFailException(f"{critical['failed_count']} validaciones críticas de usuarios fallaron:\n{details}")
+
+        logger.info(f"✅ Suite CRÍTICO de usuarios pasada: {critical['passed_count']}/{critical['total_expectations']}")
+
+        # Suite ADVERTENCIA para usuarios (detecta nulos en email - esperado)
+        warning = _execute_gx_suite(engine, "users_warnings_suite")
+        if not warning['success']:
+            logger.warning(f"⚠️ {warning['failed_count']} advertencias en usuarios (pipeline continúa)")
+
+        total = critical['total_expectations'] + warning['total_expectations']
+        failed = critical['failed_count'] + warning['failed_count']
+        rate = ((total - failed) / total * 100) if total > 0 else 0
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO audit.gx_validation_logs
+                (table_name, expectation_suite_name, total_records,
+                failed_records, success_rate, critical_failures)
+                VALUES ('audit.raw_users', 'COMBINED_SUITES', :total, :failed, :rate, :failures)
+            """), {
+                'total': total, 'failed': failed, 'rate': rate,
+                'failures': warning['failed_expectations'] if not warning['success'] else []
+            })
+
+        return {
+            'audit_passed': True,
+            'critical_suite_success': critical['success'],
+            'warning_suite_success': warning['success'],
+            'total_expectations': total,
+            'total_failed': failed,
+            'success_rate': rate
         }
 
     # -------------------------------------------------------------------------
@@ -298,7 +450,14 @@ def taller_etl_unl_wap():
         with open(suite_path, 'r') as f:
             suite_dict = json.load(f)
         expectations = suite_dict.get('expectations', [])
-        df = pd.read_sql("SELECT * FROM audit.raw_transactions", engine)
+        
+        # Determinar tabla fuente según suite
+        if 'users' in suite_name.lower():
+            table_name = "audit.raw_users"
+        else:
+            table_name = "audit.raw_transactions"
+        
+        df = pd.read_sql(f"SELECT * FROM {table_name}", engine)
 
         if len(df) == 0:
             return {'success': False, 'total_expectations': len(expectations),
@@ -411,7 +570,7 @@ def taller_etl_unl_wap():
             try:
                 logger.info(" Aplicando enmascaramiento de transaction_id...")
                 rules = load_masking_rules("/opt/airflow/config/masking_rules.json")
-                df_masked = apply_masking(df_enriched, rules)
+                df_masked = apply_masking_users(df_enriched, rules)
                 logger.info(" Enmascaramiento aplicado correctamente")
             except Exception as e:
                 logger.error(f" Falló el enmascaramiento: {e}")
@@ -458,6 +617,7 @@ def taller_etl_unl_wap():
             logger.info(f"   • Publicados: {published_count}")
             logger.info(f"   • Filtrados: {filtered_count}")
             logger.info(f"   • Duplicados evitados: {duplicate_records}")
+            logger.info(f"   • PII enmascarada: transaction_id")
 
             return {
                 'records_published': published_count,
@@ -469,6 +629,140 @@ def taller_etl_unl_wap():
         finally:
             spark.stop()
             logger.info("Sesión de Spark cerrada")
+
+    # -------------------------------------------------------------------------
+    # FASE 3B: PUBLISH USUARIOS - Transformación y enmascaramiento PII con Spark
+    # -------------------------------------------------------------------------
+    @task(task_id='publish_users_with_spark')
+    def publish_users_with_spark(audit_users_result) -> Dict[str, int]:
+        """
+        Usa Spark para procesar usuarios, enmascarar email e ip_address.
+        Aplica SHA256 hashing para datos sensibles (LDPD/GDPR compliance).
+        """
+        if audit_users_result is None:
+            return {'records_published': 0, 'reason': 'audit_result_missing'}
+
+        if isinstance(audit_users_result, dict):
+            audit_ok = audit_users_result.get('audit_passed', False)
+        else:
+            audit_ok = bool(audit_users_result)
+
+        if not audit_ok:
+            logger.error("⚠️ Auditoría de usuarios falló, NO se publican datos")
+            return {'records_published': 0, 'reason': 'audit_failed'}
+
+        logger.info("🔐 Iniciando fase PUBLISH USUARIOS: Enmascaramiento SHA256 de PII")
+
+        try:
+            from pyspark.sql import SparkSession
+            from pyspark.sql.functions import col, lit, current_timestamp, sha2
+        except ImportError as ie:
+            logger.error(" pyspark no está instalado en el entorno de Airflow.")
+            raise
+
+        spark = SparkSession.builder \
+            .appName("ETL_Publish_Users_WAP_Masked") \
+            .master("local[*]") \
+            .config("spark.driver.extraClassPath", "/opt/spark-jars/postgresql-42.5.0.jar") \
+            .config("spark.executor.extraClassPath", "/opt/spark-jars/postgresql-42.5.0.jar") \
+            .getOrCreate()
+
+        try:
+            jdbc_properties = {
+                "user": DB_CONFIG['user'],
+                "password": DB_CONFIG['password'],
+                "driver": "org.postgresql.Driver"
+            }
+            jdbc_url = f"jdbc:postgresql://{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+
+            # Leer datos desde audit de usuarios
+            logger.info("📖 Leyendo datos desde audit.raw_users")
+            df_audit_users = spark.read.jdbc(
+                url=jdbc_url,
+                table="audit.raw_users",
+                properties=jdbc_properties
+            )
+            total_records = df_audit_users.count()
+            logger.info(f"📊 Registros en audit.raw_users: {total_records}")
+
+            # Limpieza básica
+            df_clean = df_audit_users.filter(
+                (col("user_id").isNotNull()) &
+                (col("email").isNotNull()) &
+                (col("first_name").isNotNull()) &
+                (col("last_name").isNotNull()) &
+                (col("country").isNotNull())
+            )
+
+            # Enriquecimiento y enmascaramiento
+            df_enriched = df_clean.withColumn(
+                "data_quality_score", lit(1.0)
+            ).withColumn(
+                "processed_at", current_timestamp()
+            )
+            # ========== APLICAR ENMASCARAMIENTO ==========
+            try:
+                logger.info(" Aplicando enmascaramiento de email e ip_address...")
+                rules = load_masking_rules("/opt/airflow/config/masking_rules.json")
+                df_masked = apply_masking_users(df_enriched, rules)
+                logger.info(" Enmascaramiento aplicado correctamente")
+            except Exception as e:
+                logger.error(f" Falló el enmascaramiento: {e}")
+                raise
+
+            # Evitar duplicados y cargar a prod
+            logger.info("🔍 Preparando datos nuevos para prod.raw_users")
+            df_prod_existing = spark.read.jdbc(
+                url=jdbc_url,
+                table="prod.raw_users",
+                properties=jdbc_properties
+            ).select("user_id")
+
+            df_to_publish = df_masked.dropDuplicates(["user_id"]).join(
+                df_prod_existing,
+                on="user_id",
+                how="left_anti"
+            )
+
+            new_records = df_to_publish.count()
+            duplicate_records = df_masked.dropDuplicates(["user_id"]).count() - new_records
+
+            if new_records == 0:
+                logger.info("ℹ️ No hay registros nuevos de usuarios para publicar.")
+                return {
+                    'records_published': 0,
+                    'records_filtered': total_records,
+                    'duplicate_records': duplicate_records,
+                    'approval_rate': 0
+                }
+
+            logger.info(f"📝 Publicando {new_records} usuarios enmascarados en prod.raw_users")
+            df_to_publish.write.jdbc(
+                url=jdbc_url,
+                table="prod.raw_users",
+                mode="append",
+                properties=jdbc_properties
+            )
+
+            published_count = new_records
+            filtered_count = total_records - published_count
+
+            logger.info("✅ Fase PUBLISH USUARIOS completada:")
+            logger.info(f"   • Publicados: {published_count}")
+            logger.info(f"   • Filtrados: {filtered_count}")
+            logger.info(f"   • Duplicados evitados: {duplicate_records}")
+            logger.info(f"   • PII enmascarada: email, ip_address")
+
+            return {
+                'records_published': published_count,
+                'records_filtered': filtered_count,
+                'duplicate_records': duplicate_records,
+                'approval_rate': round(published_count/total_records*100, 2) if total_records > 0 else 0
+            }
+
+        finally:
+            spark.stop()
+            logger.info("Sesión de Spark cerrada para usuarios")
 
 
     # -------------------------------------------------------------------------
@@ -528,40 +822,57 @@ def taller_etl_unl_wap():
     def monitor_freshness() -> Dict[str, Any]:
         """Monitorea si los datos llegaron a tiempo."""
         logger.info("Monitoreando frescura de datos")
+        # Lista de tablas a monitorear
+        tables_to_watch = ['audit.raw_transactions', 'audit.raw_users']
+        results_summary = []
+    
         engine = create_engine(DB_URI)
 
         with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT MAX(ingested_at) as last_ingestion
-                FROM audit.raw_transactions
-                WHERE ingested_at >= NOW() - INTERVAL '24 hours'
-            """))
-            row = result.fetchone()
-            last = row[0]
+            for table in tables_to_watch:
+                logger.info(f"Analizando frescura para: {table}")
+            
+                # 1. Obtener la última ingesta (Usamos f-string solo para el nombre de la tabla)
+                # Nota: Los nombres de tablas no pueden pasarse como parámetros :bind
+                query = text(f"SELECT MAX(ingested_at) FROM {table} WHERE ingested_at >= NOW() - INTERVAL '24 hours'")
+                result = conn.execute(query)
+                last = result.fetchone()[0]
 
-            if last:
-                lag_h = (datetime.now() - last).total_seconds() / 3600
-                status = 'FRESH' if lag_h < 2 else ('STALE' if lag_h < 6 else 'MISSING')
-            else:
-                lag_h = None
-                status = 'MISSING'
+                # 2. Calcular Lag y Status
+                if last:
+                    # Asegúrate de que 'last' no tenga zona horaria si datetime.now() no la tiene
+                    # o usa datetime.now(timezone.utc) si tus datos son UTC
+                    lag_h = (datetime.now() - last).total_seconds() / 3600
+                    status = 'FRESH' if lag_h < 2 else ('STALE' if lag_h < 6 else 'MISSING')
+                else:
+                    lag_h = None
+                    status = 'MISSING'
 
-            conn.execute(text("""
-                INSERT INTO audit.data_freshness_monitor
-                (table_name, expected_arrival_time, actual_arrival_time,
-                freshness_lag, status, threshold_minutes)
-                VALUES ('audit.raw_transactions', :expected, :actual, :lag, :status, 120)
-            """), {
+                # 3. Insertar métricas en la tabla de control
+                conn.execute(text("""
+                    INSERT INTO audit.data_freshness_monitor
+                    (table_name, expected_arrival_time, actual_arrival_time,
+                    freshness_lag, status, threshold_minutes)
+                    VALUES (:t_name, :expected, :actual, :lag, :status, 120)
+                """), {
+                't_name': table,
                 'expected': datetime.now() - timedelta(hours=2),
                 'actual': last,
-                'lag': f'{lag_h} hours' if lag_h else None,
+                'lag': f'{round(lag_h, 2)} hours' if lag_h is not None else None,
                 'status': status
-            })
+                })
 
-            if status in ['STALE', 'MISSING']:
-                logger.warning(f"ALERTA FRESCURA: {status} - {lag_h}h desde ultima ingesta")
+                # 4. Alerta y guardado de resultado local
+                if status in ['STALE', 'MISSING']:
+                    logger.warning(f"⚠️ ALERTA FRESCURA [{table}]: {status} - {lag_h}h de retraso")
 
-            return {'status': status, 'lag_hours': lag_h}
+                results_summary.append({'table': table, 'status': status, 'lag_hours': lag_h})
+
+                # IMPORTANTE: En SQLAlchemy con engine.connect(), 
+                # a veces necesitas hacer conn.commit() si no está en modo autocommit
+                #conn.commit() 
+
+        return {"data": results_summary}
 
     
     @task(task_id='record_lineage', trigger_rule='all_done')
@@ -575,6 +886,7 @@ def taller_etl_unl_wap():
         exec_id = str(uuid.uuid4())[:8]
 
         nodes = [
+            #TRANSACTIONS
             ('API Transacciones', 'source', None, None, 'Fuente externa de datos'),
             ('audit.raw_transactions', 'table', 'audit', 'raw_transactions', 'Datos crudos de API'),
             ('prod.raw_transactions', 'table', 'prod', 'raw_transactions', 'Datos validados con Spark'),
@@ -582,15 +894,30 @@ def taller_etl_unl_wap():
             ('int_transactions_enriched', 'model', 'intermediate', 'int_transactions_enriched', 'Modelo dbt enriquecido'),
             ('fct_transactions', 'model', 'analytics', 'fct_transactions', 'Tabla de hechos'),
             ('dim_users', 'model', 'analytics', 'dim_users', 'Dimension usuarios'),
+            #USUARIOS
+            ('API Usuarios', 'source', None, None, 'Fuente externa de datos'),
+            ('audit.raw_users', 'table', 'audit', 'raw_users', 'Datos crudos de API'),
+            ('prod.raw_users', 'table', 'prod', 'raw_users', 'Datos validados con Spark'),
+            ('stg_raw_users', 'model', 'staging', 'stg_raw_users', 'Modelo dbt staging'),
+            ('int_users_enriched', 'model', 'intermediate', 'int_users_enriched', 'Modelo dbt enriquecido'),
+            ('fct_user_activity', 'model', 'analytics', 'fct_user_activity', 'Tabla de hechos de actividad de usuarios'),
+
         ]
 
         edges = [
+            #TRANSACTIONS
             ('API Transacciones', 'audit.raw_transactions', 'Extraccion con paginacion'),
             ('audit.raw_transactions', 'prod.raw_transactions', 'Spark: filtro COMPLETED, amount>0'),
             ('prod.raw_transactions', 'stg_raw_transactions', 'dbt: estandarizacion'),
             ('stg_raw_transactions', 'int_transactions_enriched', 'dbt: metricas historicas'),
             ('int_transactions_enriched', 'fct_transactions', 'dbt: filtro calidad >= 0.7'),
             ('int_transactions_enriched', 'dim_users', 'dbt: agregacion por usuario'),
+            #USUARIOS
+            ('API Usuarios', 'audit.raw_users', 'Extraccion con paginacion'),
+            ('audit.raw_users', 'prod.raw_users', 'Spark: enmascaramiento email/ip y filtros'),
+            ('prod.raw_users', 'stg_raw_users', 'dbt: estandarizacion'),
+            ('stg_raw_users', 'int_users_enriched', 'dbt: metricas historicas'),
+            ('int_users_enriched', 'fct_user_activity', 'dbt: actividad de usuarios')
         ]
 
         with engine.begin() as conn:
@@ -616,14 +943,28 @@ def taller_etl_unl_wap():
     # DEFINIR FLUJO DE TAREAS (DAG)
     # -------------------------------------------------------------------------
 
-    # Ejecutar fases en secuencia con paso de métricas entre tareas
+    # FLUJO PARALELO: Extracción de transacciones y usuarios en paralelo
     extract_result = write_to_audit()
-    #freshness = monitor_freshness()
-    extract_result >> monitor_freshness()  # Ejecutar monitoreo de frescura después de extracción
-    audit_result = audit_with_gx(extract_result)
-    publish_result = publish_with_spark(audit_result)
-    dbt_result = materialize_with_dbt(publish_result)
-    record_lineage(audit_result, publish_result, dbt_result)
+    #extract_users = write_users_to_audit()
+    
+    # Monitoreo de frescura
+    freshness = monitor_freshness()
+    extract_result >> freshness
+    
+    # VALIDACIÓN en paralelo
+    audit_tx = audit_with_gx(extract_result)
+    audit_users = audit_users_with_gx(extract_result)
+    
+    # PUBLICACIÓN en paralelo
+    publish_tx = publish_with_spark(audit_tx)
+    publish_users = publish_users_with_spark(audit_users)
+    
+    # DBT después de ambas publicaciones
+    dbt_result = materialize_with_dbt(publish_tx)
+    [publish_tx, publish_users] >> dbt_result
+    
+    # Linaje final
+    record_lineage(audit_tx, publish_tx, dbt_result)
 
     # El DAG retorna el resultado final para logging
     return {"status": "completed", "timestamp": datetime.now().isoformat()}

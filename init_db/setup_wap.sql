@@ -36,7 +36,39 @@ CREATE TABLE IF NOT EXISTS prod.raw_transactions (
     data_quality_score NUMERIC(3, 2)
 );
 
--- TABLA DE LOGS DE VALIDACION DE DATOS (Great Expectations)
+-- ========================== TABLAS DE USUARIOS (WAP) ==========================
+
+-- TABLA DE AUDITORIA PARA USUARIOS (Write Phase)
+CREATE TABLE IF NOT EXISTS audit.raw_users (
+    user_id INT PRIMARY KEY,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    email VARCHAR(255),  -- Puede ser nulo (5% inyectado intencionalmente)
+    ip_address VARCHAR(45) NOT NULL,  -- IPv4 o IPv6
+    country VARCHAR(50) NOT NULL,
+    registration_date DATE NOT NULL,
+    -- Metadatos de ingesta
+    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source_file VARCHAR(255),
+    -- Columnas para Great Expectations
+    gx_validation_status VARCHAR(20) DEFAULT 'PENDING',
+    gx_validation_errors TEXT
+);
+
+-- Indices para optimizar consultas de usuarios
+CREATE INDEX IF NOT EXISTS idx_audit_users_email ON audit.raw_users (email) WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_users_country ON audit.raw_users (country);
+CREATE INDEX IF NOT EXISTS idx_audit_users_registration_date ON audit.raw_users (registration_date);
+
+-- TABLA DE PRODUCCION PARA USUARIOS (Publish Phase)
+CREATE TABLE IF NOT EXISTS prod.raw_users (
+    LIKE audit.raw_users INCLUDING ALL,
+    -- Columnas adicionales para la zona de producción
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    data_quality_score NUMERIC(3, 2)
+);
+
+-- TABLA DE LOGS DE VALIDACION PARA USUARIOS
 CREATE TABLE IF NOT EXISTS audit.gx_validation_logs (
     log_id SERIAL PRIMARY KEY,
     validation_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -172,7 +204,13 @@ INSERT INTO audit.pii_catalog
 VALUES
 ('audit', 'raw_transactions', 'user_id', 'direct_identifier', 'high', 'hash_salting', 'production_only', 365, 'Consentimiento del usuario - LDPD Art. 8'),
 ('prod', 'raw_transactions', 'user_id', 'direct_identifier', 'high', 'hash_salting', 'production_only', 365, 'Consentimiento del usuario - LDPD Art. 8'),
-('staging', 'stg_raw_transactions', 'user_id', 'direct_identifier', 'high', 'hash_salting', 'production_only', 365, 'Consentimiento del usuario - LDPD Art. 8')
+('staging', 'stg_raw_transactions', 'user_id', 'direct_identifier', 'high', 'hash_salting', 'production_only', 365, 'Consentimiento del usuario - LDPD Art. 8'),
+('audit', 'raw_users', 'email', 'contact_information', 'high', 'hash_sha256', 'restricted', 180, 'LDPD Art. 12 - Consentimiento'),
+('audit', 'raw_users', 'ip_address', 'device_identifier', 'medium', 'hash_sha256', 'restricted', 90, 'LDPD Art. 12 - Auditoría de seguridad'),
+('prod', 'raw_users', 'email', 'contact_information', 'high', 'hash_sha256', 'restricted', 180, 'LDPD Art. 12 - Consentimiento'),
+('prod', 'raw_users', 'ip_address', 'device_identifier', 'medium', 'hash_sha256', 'restricted', 90, 'LDPD Art. 12 - Auditoría de seguridad'),
+('staging', 'stg_raw_users', 'email', 'contact_information', 'high', 'hash_sha256', 'restricted', 180, 'LDPD Art. 12 - Consentimiento'),
+('staging', 'stg_raw_users', 'ip_address', 'device_identifier', 'medium', 'hash_sha256', 'restricted', 90, 'LDPD Art. 12 - Auditoría de seguridad')
 ON CONFLICT (schema_name, table_name, column_name) DO NOTHING;
 
 -- Vista de consulta
@@ -204,6 +242,32 @@ SELECT
     -- data_quality_score
 FROM audit.raw_transactions;
 
+-- VISTAS ENMASCARADAS PARA USUARIOS
+-- Vista para desarrolladores (audit.raw_users - datos sin procesar)
+CREATE OR REPLACE VIEW audit.v_masked_users AS
+SELECT
+    user_id,
+    CONCAT('dev_', MD5(first_name::TEXT)) AS first_name_masked,
+    CONCAT('dev_', MD5(last_name::TEXT)) AS last_name_masked,
+    CONCAT('user_', MD5(COALESCE(email, 'NULL')::TEXT)) AS email_masked,
+    CONCAT('ip_', MD5(ip_address::TEXT)) AS ip_address_masked,
+    country,
+    registration_date
+FROM audit.raw_users;
+
+-- Vista para producción (prod.raw_users - datos procesados y validados)
+CREATE OR REPLACE VIEW prod.v_masked_users AS
+SELECT
+    user_id,
+    CONCAT('U', LEFT(MD5(first_name::TEXT), 8)) AS first_name_short,
+    CONCAT('U', LEFT(MD5(last_name::TEXT), 8)) AS last_name_short,
+    email,
+    ip_address,
+    country,
+    registration_date,
+    data_quality_score
+FROM prod.raw_users;
+
 -- VISTA ENMASCARADA PARA PRODUCCION (analistas de negocio)
 CREATE OR REPLACE VIEW prod.v_masked_transactions AS
 SELECT
@@ -216,7 +280,9 @@ SELECT
     status
 FROM prod.raw_transactions;
 
--- Grants diferenciados
+-- Grants diferenciados para usuarios
+GRANT SELECT ON audit.v_masked_users TO user_dev;
+GRANT SELECT ON prod.v_masked_users TO user_analyst;
 GRANT SELECT ON audit.v_masked_transactions TO user_dev;
 GRANT SELECT ON prod.v_masked_transactions TO user_analyst;
 
@@ -230,6 +296,14 @@ RETURNS text AS $$
 BEGIN
 -- Usa digest con SHA256 y devuelve hex
 RETURN encode(digest(CAST(user_id AS text) || 'mi_salt_secreto', 'sha256'), 'hex');
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Esta nueva servirá para emails e IPs
+CREATE OR REPLACE FUNCTION pseudonymize_email_ip(input_data text) 
+RETURNS text AS $$
+BEGIN
+    RETURN encode(digest(input_data || 'mi_salt_secreto', 'sha256'), 'hex');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
@@ -249,6 +323,20 @@ SELECT
 FROM prod.raw_transactions t;
 
 GRANT SELECT ON analytics.v_analytics_transactions TO user_analyst;
+
+CREATE OR REPLACE VIEW analytics.v_analytics_users AS
+SELECT
+    u.user_id,
+    u.first_name,
+    u.last_name,
+    pseudonymize_email_ip(u.email) AS pseudo_email,
+    pseudonymize_email_ip(u.ip_address) AS pseudo_ip_address,
+    u.registration_date,
+    u.country,
+    u.data_quality_score
+FROM prod.raw_users u;
+
+GRANT SELECT ON analytics.v_analytics_users TO user_analyst;
 
 -- TABLA DE CLAVES DE ENCRIPTACION POR USUARIO
 -- Cada usuario tiene su propia clave simetrica
