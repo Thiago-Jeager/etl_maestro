@@ -618,7 +618,8 @@ def taller_etl_unl_wap():
 
     # Ejecutar fases en secuencia con paso de métricas entre tareas
     extract_result = write_to_audit()
-    freshness = monitor_freshness()
+    #freshness = monitor_freshness()
+    extract_result >> monitor_freshness()  # Ejecutar monitoreo de frescura después de extracción
     audit_result = audit_with_gx(extract_result)
     publish_result = publish_with_spark(audit_result)
     dbt_result = materialize_with_dbt(publish_result)
