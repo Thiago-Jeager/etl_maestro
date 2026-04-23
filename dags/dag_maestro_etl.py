@@ -840,7 +840,6 @@ def taller_etl_unl_wap():
 
                 # 2. Calcular Lag y Status
                 if last:
-                    # Asegúrate de que 'last' no tenga zona horaria si datetime.now() no la tiene
                     # o usa datetime.now(timezone.utc) si tus datos son UTC
                     lag_h = (datetime.now() - last).total_seconds() / 3600
                     status = 'FRESH' if lag_h < 2 else ('STALE' if lag_h < 6 else 'MISSING')
